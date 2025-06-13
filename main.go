@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -29,6 +32,7 @@ type Config struct {
 	KeyID        string
 	SecretKey    string
 	SessionToken string
+	Concurrency  int
 }
 
 func main() {
@@ -70,6 +74,7 @@ func parseFlags() Config {
 	flag.StringVar(&cfg.KeyID, "key-id", "", "AWS Access Key ID (optional, uses AWS config if not provided)")
 	flag.StringVar(&cfg.SecretKey, "secret-key", "", "AWS Secret Access Key (optional, uses AWS config if not provided)")
 	flag.StringVar(&cfg.SessionToken, "session-token", "", "AWS Session Token (optional, for temporary credentials)")
+	flag.IntVar(&cfg.Concurrency, "concurrency", 1, "Number of concurrent uploads (default: 1, no concurrency)")
 
 	flag.Parse()
 
@@ -149,19 +154,28 @@ func populateS3(ctx context.Context, s3Client *s3.Client, cfg Config) error {
 		"bucket", cfg.Bucket,
 		"count", cfg.Count,
 		"rate", cfg.Rate,
-		"file_size", cfg.FileSize)
+		"file_size", cfg.FileSize,
+		"concurrency", cfg.Concurrency)
 
 	var limiter *rate.Limiter
 	if cfg.Rate > 0 {
-		limiter = rate.NewLimiter(rate.Limit(cfg.Rate), 1)
-		slog.Debug("Rate limiter configured", "rate", cfg.Rate)
+		// With concurrency, we need to adjust the rate limiter
+		// The burst should accommodate concurrent requests
+		burst := cfg.Concurrency
+		if burst < 1 {
+			burst = 1
+		}
+		limiter = rate.NewLimiter(rate.Limit(cfg.Rate), burst)
+		slog.Debug("Rate limiter configured", "rate", cfg.Rate, "burst", burst)
 	}
 
-	var uploaded, errors int
-	progressStep := cfg.Count / 100
-	if progressStep == 0 {
-		progressStep = 1
-	}
+	// Thread-safe counters
+	var uploaded, errors int64
+	var processed int64
+
+	lastProgressReport := time.Now()
+	progressInterval := 10 * time.Second
+	var progressMutex sync.Mutex
 
 	fileData := make([]byte, cfg.FileSize)
 	if _, err := rand.Read(fileData); err != nil {
@@ -170,66 +184,106 @@ func populateS3(ctx context.Context, s3Client *s3.Client, cfg Config) error {
 
 	start := time.Now()
 
+	// Create work channel
+	workChan := make(chan int, cfg.Count)
+
+	// Fill work channel
 	for i := 0; i < cfg.Count; i++ {
-		if limiter != nil {
-			if err := limiter.Wait(ctx); err != nil {
-				return fmt.Errorf("rate limiter error: %w", err)
+		workChan <- i
+	}
+	close(workChan)
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < cfg.Concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			for range workChan {
+				if limiter != nil {
+					if err := limiter.Wait(ctx); err != nil {
+						slog.Error("Rate limiter error", "worker", workerID, "error", err)
+						atomic.AddInt64(&errors, 1)
+						continue
+					}
+				}
+
+				key := generateRandomFileKey(cfg.Depth)
+				slog.Debug("Uploading file", "worker", workerID, "key", key, "size", cfg.FileSize)
+
+				if err := uploadFile(ctx, s3Client, cfg.Bucket, key, fileData); err != nil {
+					slog.Error("Failed to upload file", "worker", workerID, "key", key, "error", err)
+					atomic.AddInt64(&errors, 1)
+				} else {
+					atomic.AddInt64(&uploaded, 1)
+					slog.Debug("Successfully uploaded file", "worker", workerID, "key", key)
+				}
+
+				currentProcessed := atomic.AddInt64(&processed, 1)
+
+				// Check if we need to report progress (thread-safe)
+				progressMutex.Lock()
+				if time.Since(lastProgressReport) >= progressInterval || int(currentProcessed) == cfg.Count {
+					progress := float64(currentProcessed) / float64(cfg.Count) * 100
+					elapsed := time.Since(start)
+					currentUploaded := atomic.LoadInt64(&uploaded)
+					currentErrors := atomic.LoadInt64(&errors)
+					uploadRate := float64(currentUploaded) / elapsed.Seconds()
+
+					slog.Info("Progress update",
+						"progress", fmt.Sprintf("%.1f%%", progress),
+						"uploaded", currentUploaded,
+						"errors", currentErrors,
+						"elapsed", elapsed.Round(time.Second),
+						"rate", fmt.Sprintf("%.2f files/sec", uploadRate))
+					lastProgressReport = time.Now()
+				}
+				progressMutex.Unlock()
 			}
-		}
-
-		key := generateFileKey(i+1, cfg.Depth)
-
-		slog.Debug("Uploading file", "key", key, "size", cfg.FileSize)
-
-		if err := uploadFile(ctx, s3Client, cfg.Bucket, key, fileData); err != nil {
-			slog.Error("Failed to upload file", "key", key, "error", err)
-			errors++
-		} else {
-			uploaded++
-			slog.Debug("Successfully uploaded file", "key", key)
-		}
-
-		if (i+1)%progressStep == 0 || i+1 == cfg.Count {
-			progress := float64(i+1) / float64(cfg.Count) * 100
-			elapsed := time.Since(start)
-			slog.Info("Progress update",
-				"progress", fmt.Sprintf("%.1f%%", progress),
-				"uploaded", uploaded,
-				"errors", errors,
-				"elapsed", elapsed.Round(time.Second))
-		}
+		}(i)
 	}
 
+	// Wait for all workers to complete
+	wg.Wait()
+
 	duration := time.Since(start)
+	finalUploaded := atomic.LoadInt64(&uploaded)
+	finalErrors := atomic.LoadInt64(&errors)
+
 	slog.Info("S3 population completed",
 		"total_files", cfg.Count,
-		"uploaded", uploaded,
-		"errors", errors,
+		"uploaded", finalUploaded,
+		"errors", finalErrors,
 		"duration", duration.Round(time.Second),
-		"rate", fmt.Sprintf("%.2f files/sec", float64(cfg.Count)/duration.Seconds()))
+		"rate", fmt.Sprintf("%.2f files/sec", float64(finalUploaded)/duration.Seconds()),
+		"concurrency", cfg.Concurrency)
 
-	if errors > 0 {
-		return fmt.Errorf("completed with %d errors out of %d files", errors, cfg.Count)
+	if finalErrors > 0 {
+		return fmt.Errorf("completed with %d errors out of %d files", finalErrors, cfg.Count)
 	}
 
 	return nil
 }
 
-func generateFileKey(index, depth int) string {
+func generateRandomFileKey(depth int) string {
 	if depth == 0 {
-		return fmt.Sprintf("file-%06d.dat", index)
+		return generateRandomString(16) + ".dat"
 	}
 
 	var pathParts []string
-	seed := index
 	for i := 0; i < depth; i++ {
-		dirNum := (seed*31 + i) % 4
-		pathParts = append(pathParts, fmt.Sprintf("dir%d", dirNum))
-		seed = seed*7 + dirNum
+		pathParts = append(pathParts, generateRandomString(8))
 	}
-	pathParts = append(pathParts, fmt.Sprintf("file-%06d.dat", index))
+	pathParts = append(pathParts, generateRandomString(16)+".dat")
 
 	return strings.Join(pathParts, "/")
+}
+
+func generateRandomString(length int) string {
+	bytes := make([]byte, length/2)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
 }
 
 func uploadFile(ctx context.Context, s3Client *s3.Client, bucket, key string, data []byte) error {

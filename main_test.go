@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,11 +111,12 @@ func TestConfigValidation(t *testing.T) {
 		{
 			name: "valid config",
 			config: Config{
-				Bucket:   "test-bucket",
-				Count:    100,
-				Rate:     10,
-				LogLevel: "info",
-				FileSize: 1024,
+				Bucket:      "test-bucket",
+				Count:       100,
+				Rate:        10,
+				LogLevel:    "info",
+				FileSize:    1024,
+				Concurrency: 1,
 			},
 			valid: true,
 		},
@@ -173,6 +176,30 @@ func TestConfigValidation(t *testing.T) {
 			},
 			valid: false,
 		},
+		{
+			name: "zero concurrency",
+			config: Config{
+				Bucket:      "test-bucket",
+				Count:       100,
+				Rate:        10,
+				LogLevel:    "info",
+				FileSize:    1024,
+				Concurrency: 0,
+			},
+			valid: false,
+		},
+		{
+			name: "negative concurrency",
+			config: Config{
+				Bucket:      "test-bucket",
+				Count:       100,
+				Rate:        10,
+				LogLevel:    "info",
+				FileSize:    1024,
+				Concurrency: -1,
+			},
+			valid: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -187,23 +214,21 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestProgressCalculation(t *testing.T) {
+func TestRandomStringGeneration(t *testing.T) {
 	tests := []struct {
-		name         string
-		total        int
-		current      int
-		expectedStep int
+		name   string
+		length int
 	}{
-		{"100 files", 100, 50, 1},
-		{"1000 files", 1000, 500, 10},
-		{"50 files", 50, 25, 1},
-		{"10 files", 10, 5, 1},
+		{"8 chars", 8},
+		{"16 chars", 16},
+		{"32 chars", 32},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			step := calculateProgressStep(tt.total)
-			assert.Equal(t, tt.expectedStep, step)
+			result := generateRandomString(tt.length)
+			assert.Equal(t, tt.length, len(result))
+			assert.Regexp(t, "^[a-f0-9]+$", result, "Should contain only hex characters")
 		})
 	}
 }
@@ -244,10 +269,11 @@ func TestErrorHandling(t *testing.T) {
 	mockClient.On("PutObject", mock.Anything, mock.Anything).Return(&s3.PutObjectOutput{}, errors.New("network error"))
 
 	cfg := Config{
-		Bucket:   "test-bucket",
-		Count:    5,
-		Rate:     0,
-		FileSize: 100,
+		Bucket:      "test-bucket",
+		Count:       5,
+		Rate:        0,
+		FileSize:    100,
+		Concurrency: 1,
 	}
 
 	ctx := context.Background()
@@ -266,48 +292,131 @@ func TestFileGeneration(t *testing.T) {
 	assert.Len(t, data2, 2048)
 }
 
-func TestKeyGeneration(t *testing.T) {
+func TestRandomKeyGeneration(t *testing.T) {
 	tests := []struct {
-		name     string
-		index    int
-		depth    int
-		expected string
+		name  string
+		depth int
 	}{
-		{"no depth", 1, 0, "file-000001.dat"},
-		{"no depth large", 42, 0, "file-000042.dat"},
-		{"depth 1", 1, 1, "dir3/file-000001.dat"},
-		{"depth 1 index 2", 2, 1, "dir2/file-000002.dat"},
-		{"depth 1 index 3", 3, 1, "dir1/file-000003.dat"},
-		{"depth 1 index 4", 4, 1, "dir0/file-000004.dat"},
-		{"depth 3", 1, 3, "dir3/dir3/dir1/file-000001.dat"},
-		{"depth 3 index 5", 5, 3, "dir3/dir3/dir1/file-000005.dat"},
+		{"no depth", 0},
+		{"depth 1", 1},
+		{"depth 3", 3},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			key := generateFileKey(tt.index, tt.depth)
-			assert.Equal(t, tt.expected, key)
+			key := generateRandomFileKey(tt.depth)
+			assert.Contains(t, key, ".dat", "Should have .dat extension")
+
+			parts := strings.Split(key, "/")
+			expectedParts := tt.depth + 1
+			assert.Equal(t, expectedParts, len(parts), "Should have correct number of path parts")
+
+			// Check that all parts are valid hex strings
+			for i, part := range parts {
+				if i == len(parts)-1 {
+					// Last part is filename
+					assert.True(t, strings.HasSuffix(part, ".dat"))
+					filename := strings.TrimSuffix(part, ".dat")
+					assert.Equal(t, 16, len(filename))
+					assert.Regexp(t, "^[a-f0-9]+$", filename)
+				} else {
+					// Directory part
+					assert.Equal(t, 8, len(part))
+					assert.Regexp(t, "^[a-f0-9]+$", part)
+				}
+			}
 		})
 	}
 }
 
-func TestDirectoryDistribution(t *testing.T) {
-	dirCounts := make(map[string]int)
+func TestRandomKeyUniqueness(t *testing.T) {
+	keys := make(map[string]bool)
 
-	for i := 1; i <= 100; i++ {
-		key := generateFileKey(i, 1)
-		parts := strings.Split(key, "/")
-		if len(parts) >= 1 {
-			dirCounts[parts[0]]++
-		}
+	// Generate 100 random keys and ensure they're unique
+	for i := 0; i < 100; i++ {
+		key := generateRandomFileKey(1)
+		assert.False(t, keys[key], "Generated key should be unique: %s", key)
+		keys[key] = true
 	}
 
-	assert.Len(t, dirCounts, 4, "Should have exactly 4 different directories")
+	assert.Equal(t, 100, len(keys), "Should have 100 unique keys")
+}
 
-	for dir, count := range dirCounts {
-		assert.Contains(t, []string{"dir0", "dir1", "dir2", "dir3"}, dir)
-		assert.Greater(t, count, 0, "Each directory should have at least one file")
+func TestConcurrency(t *testing.T) {
+	tests := []struct {
+		name        string
+		concurrency int
+		count       int
+		expectCalls int
+	}{
+		{"single worker", 1, 5, 5},
+		{"multiple workers", 3, 10, 10},
+		{"more workers than tasks", 10, 5, 5},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockClient := &MockS3Client{}
+			mockClient.On("PutObject", mock.Anything, mock.Anything).Return(&s3.PutObjectOutput{}, nil)
+
+			cfg := Config{
+				Bucket:      "test-bucket",
+				Count:       tt.count,
+				Rate:        0,
+				FileSize:    100,
+				Concurrency: tt.concurrency,
+			}
+
+			ctx := context.Background()
+			err := populateS3WithClient(ctx, mockClient, cfg)
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectCalls, len(mockClient.Calls))
+			mockClient.AssertExpectations(t)
+		})
+	}
+}
+
+func TestConcurrencyWithErrors(t *testing.T) {
+	mockClient := &MockS3Client{}
+	mockClient.On("PutObject", mock.Anything, mock.Anything).Return(&s3.PutObjectOutput{}, errors.New("network error"))
+
+	cfg := Config{
+		Bucket:      "test-bucket",
+		Count:       5,
+		Rate:        0,
+		FileSize:    100,
+		Concurrency: 3,
+	}
+
+	ctx := context.Background()
+	err := populateS3WithClient(ctx, mockClient, cfg)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "errors")
+	assert.Equal(t, 5, len(mockClient.Calls))
+	mockClient.AssertExpectations(t)
+}
+
+func TestConcurrencyRaceConditions(t *testing.T) {
+	// This test verifies that concurrent access doesn't cause race conditions
+	mockClient := &MockS3Client{}
+	mockClient.On("PutObject", mock.Anything, mock.Anything).Return(&s3.PutObjectOutput{}, nil)
+
+	cfg := Config{
+		Bucket:      "test-bucket",
+		Count:       100,
+		Rate:        0,
+		FileSize:    100,
+		Concurrency: 10,
+	}
+
+	ctx := context.Background()
+	err := populateS3WithClient(ctx, mockClient, cfg)
+
+	assert.NoError(t, err)
+	assert.Equal(t, 100, len(mockClient.Calls))
+	mockClient.AssertExpectations(t)
 }
 
 func TestMainIntegration(t *testing.T) {
@@ -355,15 +464,10 @@ func validateConfig(cfg Config) error {
 	if cfg.Depth < 0 {
 		return errors.New("depth cannot be negative")
 	}
-	return nil
-}
-
-func calculateProgressStep(total int) int {
-	step := total / 100
-	if step == 0 {
-		step = 1
+	if cfg.Concurrency < 1 {
+		return errors.New("concurrency must be at least 1")
 	}
-	return step
+	return nil
 }
 
 func populateS3WithClient(ctx context.Context, client S3Client, cfg Config) error {
@@ -371,18 +475,41 @@ func populateS3WithClient(ctx context.Context, client S3Client, cfg Config) erro
 		return nil
 	}
 
-	var uploaded, errorCount int
+	// Use atomic counters for thread safety
+	var uploaded, errorCount int64
 	fileData := generateRandomData(cfg.FileSize)
 
+	// Create work channel
+	workChan := make(chan int, cfg.Count)
 	for i := 0; i < cfg.Count; i++ {
-		key := generateFileKey(i+1, cfg.Depth)
-
-		if err := uploadFileWithClient(ctx, client, cfg.Bucket, key, fileData); err != nil {
-			errorCount++
-		} else {
-			uploaded++
-		}
+		workChan <- i
 	}
+	close(workChan)
+
+	// Handle concurrency
+	concurrency := cfg.Concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range workChan {
+				key := generateRandomFileKey(cfg.Depth)
+				if err := uploadFileWithClient(ctx, client, cfg.Bucket, key, fileData); err != nil {
+					atomic.AddInt64(&errorCount, 1)
+				} else {
+					atomic.AddInt64(&uploaded, 1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 
 	if errorCount > 0 {
 		return errors.New("completed with errors")
