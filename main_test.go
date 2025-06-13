@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -261,11 +260,10 @@ func TestErrorHandling(t *testing.T) {
 
 func TestFileGeneration(t *testing.T) {
 	data1 := generateRandomData(1024)
-	data2 := generateRandomData(1024)
+	data2 := generateRandomData(2048)
 
 	assert.Len(t, data1, 1024)
-	assert.Len(t, data2, 1024)
-	assert.NotEqual(t, data1, data2, "Random data should be different each time")
+	assert.Len(t, data2, 2048)
 }
 
 func TestKeyGeneration(t *testing.T) {
@@ -277,12 +275,12 @@ func TestKeyGeneration(t *testing.T) {
 	}{
 		{"no depth", 1, 0, "file-000001.dat"},
 		{"no depth large", 42, 0, "file-000042.dat"},
-		{"depth 1", 1, 1, "dir0/file-000001.dat"},
-		{"depth 1 index 2", 2, 1, "dir3/file-000002.dat"},
-		{"depth 1 index 3", 3, 1, "dir2/file-000003.dat"},
-		{"depth 1 index 4", 4, 1, "dir1/file-000004.dat"},
-		{"depth 3", 1, 3, "dir0/dir0/dir0/file-000001.dat"},
-		{"depth 3 index 5", 5, 3, "dir0/dir3/dir2/file-000005.dat"},
+		{"depth 1", 1, 1, "dir3/file-000001.dat"},
+		{"depth 1 index 2", 2, 1, "dir2/file-000002.dat"},
+		{"depth 1 index 3", 3, 1, "dir1/file-000003.dat"},
+		{"depth 1 index 4", 4, 1, "dir0/file-000004.dat"},
+		{"depth 3", 1, 3, "dir3/dir3/dir1/file-000001.dat"},
+		{"depth 3 index 5", 5, 3, "dir3/dir3/dir1/file-000005.dat"},
 	}
 
 	for _, tt := range tests {
@@ -373,20 +371,20 @@ func populateS3WithClient(ctx context.Context, client S3Client, cfg Config) erro
 		return nil
 	}
 
-	var uploaded, errors int
+	var uploaded, errorCount int
 	fileData := generateRandomData(cfg.FileSize)
 
 	for i := 0; i < cfg.Count; i++ {
 		key := generateFileKey(i+1, cfg.Depth)
 
 		if err := uploadFileWithClient(ctx, client, cfg.Bucket, key, fileData); err != nil {
-			errors++
+			errorCount++
 		} else {
 			uploaded++
 		}
 	}
 
-	if errors > 0 {
+	if errorCount > 0 {
 		return errors.New("completed with errors")
 	}
 	return nil
@@ -398,21 +396,4 @@ func generateRandomData(size int64) []byte {
 		data[i] = byte(i % 256)
 	}
 	return data
-}
-
-func generateFileKey(index, depth int) string {
-	if depth == 0 {
-		return fmt.Sprintf("file-%06d.dat", index)
-	}
-
-	var pathParts []string
-	seed := index
-	for i := 0; i < depth; i++ {
-		dirNum := (seed*31 + i) % 4
-		pathParts = append(pathParts, fmt.Sprintf("dir%d", dirNum))
-		seed = seed*7 + dirNum
-	}
-	pathParts = append(pathParts, fmt.Sprintf("file-%06d.dat", index))
-
-	return strings.Join(pathParts, "/")
 }

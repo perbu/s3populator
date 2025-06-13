@@ -12,19 +12,23 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"golang.org/x/time/rate"
 )
 
 type Config struct {
-	Bucket   string
-	Count    int
-	Rate     int
-	LogLevel string
-	Endpoint string
-	Region   string
-	FileSize int64
-	Depth    int
+	Bucket       string
+	Count        int
+	Rate         int
+	LogLevel     string
+	Endpoint     string
+	Region       string
+	FileSize     int64
+	Depth        int
+	KeyID        string
+	SecretKey    string
+	SessionToken string
 }
 
 func main() {
@@ -63,6 +67,9 @@ func parseFlags() Config {
 	flag.StringVar(&cfg.Region, "region", "us-east-1", "AWS region")
 	flag.Int64Var(&cfg.FileSize, "file-size", 1024, "Size of each file in bytes")
 	flag.IntVar(&cfg.Depth, "depth", 0, "Folder depth (number of slashes in object key, 0 = no folders)")
+	flag.StringVar(&cfg.KeyID, "key-id", "", "AWS Access Key ID (optional, uses AWS config if not provided)")
+	flag.StringVar(&cfg.SecretKey, "secret-key", "", "AWS Secret Access Key (optional, uses AWS config if not provided)")
+	flag.StringVar(&cfg.SessionToken, "session-token", "", "AWS Session Token (optional, for temporary credentials)")
 
 	flag.Parse()
 
@@ -105,7 +112,21 @@ func setupLogging(level string) error {
 func createS3Client(ctx context.Context, cfg Config) (*s3.Client, error) {
 	slog.Debug("Creating S3 client", "region", cfg.Region, "endpoint", cfg.Endpoint)
 
-	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.Region))
+	var awsCfg aws.Config
+	var err error
+
+	if cfg.KeyID != "" && cfg.SecretKey != "" {
+		slog.Debug("Using provided AWS credentials")
+		creds := credentials.NewStaticCredentialsProvider(cfg.KeyID, cfg.SecretKey, cfg.SessionToken)
+		awsCfg, err = config.LoadDefaultConfig(ctx,
+			config.WithRegion(cfg.Region),
+			config.WithCredentialsProvider(creds),
+		)
+	} else {
+		slog.Debug("Using default AWS configuration")
+		awsCfg, err = config.LoadDefaultConfig(ctx, config.WithRegion(cfg.Region))
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
